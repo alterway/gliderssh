@@ -193,9 +193,9 @@ func TestValidateSocketPath(t *testing.T) {
 		path      string
 		opts      UnixForwardingOptions
 		wantErr   bool
-		wantClean string    // expected cleaned path on success
-		errSubstr string    // substring expected in error message
-		wantType  error     // expected error type (ErrRejected)
+		wantClean string // expected cleaned path on success
+		errSubstr string // substring expected in error message
+		wantType  error  // expected error type (ErrRejected)
 	}{
 		// Basic validation (applies to all modes).
 		{
@@ -444,6 +444,109 @@ func TestValidateSocketPath(t *testing.T) {
 				t.Fatalf("validateSocketPath(%q) = %q; want %q", tt.path, cleaned, tt.wantClean)
 			}
 		})
+	}
+}
+
+func TestLocalUnixForwardingRejectsSymlinkEscape(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := newContext(nil)
+	defer cancel()
+
+	// A socket outside the allowed directory that a restricted user must
+	// not be able to reach (stand-in for /var/run/docker.sock).
+	outsideDir := tempDirUnixSocket(t)
+	outsidePath := filepath.Join(outsideDir, "secret.sock")
+	outsideLn, err := net.Listen("unix", outsidePath)
+	if err != nil {
+		t.Fatalf("failed to listen on outside socket: %v", err)
+	}
+	defer outsideLn.Close() //nolint:errcheck
+
+	// The only directory the user is allowed to forward into, plus a
+	// symlink inside it pointing at the outside socket.
+	allowedDir := tempDirUnixSocket(t)
+	linkPath := filepath.Join(allowedDir, "link.sock")
+	if err := os.Symlink(outsidePath, linkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	cb := NewLocalUnixForwardingCallback(UnixForwardingOptions{
+		AllowedDirectories: []string{allowedDir},
+	})
+
+	// Directly forwarding to the outside socket is rejected lexically.
+	if _, err := cb(ctx, outsidePath); !errors.Is(err, ErrRejected) {
+		t.Fatalf("direct forward to outside socket: got %v; want ErrRejected", err)
+	}
+
+	// Forwarding via the symlink must also be rejected: the resolved
+	// destination escapes the allowed directory.
+	if _, err := cb(ctx, linkPath); !errors.Is(err, ErrRejected) {
+		t.Fatalf("forward via symlink escaping allowed dir: got %v; want ErrRejected", err)
+	}
+}
+
+func TestLocalUnixForwardingAllowsSymlinkWithinAllowedDir(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := newContext(nil)
+	defer cancel()
+
+	// A symlink whose target is also inside the allowed directory is
+	// legitimate.
+	allowedDir := tempDirUnixSocket(t)
+	realPath := filepath.Join(allowedDir, "real.sock")
+	ln, err := net.Listen("unix", realPath)
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close() //nolint:errcheck
+
+	linkPath := filepath.Join(allowedDir, "link.sock")
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	cb := NewLocalUnixForwardingCallback(UnixForwardingOptions{
+		AllowedDirectories: []string{allowedDir},
+	})
+
+	conn, err := cb(ctx, linkPath)
+	_ = conn.Close()
+	if err != nil {
+		t.Fatalf("forward via symlink within allowed dir: unexpected error %v", err)
+	}
+}
+
+func TestReverseUnixForwardingRejectsSymlinkEscape(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := newContext(nil)
+	t.Cleanup(cancel)
+
+	// A directory outside the allowed area that a restricted user must not be able to bind sockets into
+	outsideDir := tempDirUnixSocket(t)
+
+	// The only directory the user is allowed to bind into, plus a symlink inside it pointing at the outside directory
+	allowedDir := tempDirUnixSocket(t)
+	linkDir := filepath.Join(allowedDir, "escape")
+	if err := os.Symlink(outsideDir, linkDir); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	cb := NewReverseUnixForwardingCallback(UnixForwardingOptions{
+		AllowedDirectories: []string{allowedDir},
+	})
+
+	// Directly binding in the outside directory is rejected lexically
+	if _, err := cb(ctx, filepath.Join(outsideDir, "test.sock")); !errors.Is(err, ErrRejected) {
+		t.Fatalf("direct bind outside allowed dir: got %v; want ErrRejected", err)
+	}
+
+	// Binding via the symlinked parent is also rejected
+	if _, err := cb(ctx, filepath.Join(linkDir, "test.sock")); !errors.Is(err, ErrRejected) {
+		t.Fatalf("bind via symlink escaping allowed dir: got %v; want ErrRejected", err)
 	}
 }
 
